@@ -5,7 +5,7 @@ CLI tool to sync environment secrets to [Bitwarden Secrets Manager](https://bitw
 ## What it does
 
 - **Dev**: Reads your `.env` file and syncs all variables to BWS in one shot
-- **Staging/Production**: Prompts you for each secret value interactively (like `gh secret set`)
+- **Staging/Production**: Bulk import from pasted env output, or enter values manually
 - Automatically updates GitHub Actions workflow files with the correct BWS secret UUIDs
 - Manages GitHub environment secrets (creates environments, sets `BWS_ACCESS_TOKEN`)
 
@@ -55,7 +55,23 @@ The script will:
 3. Validate access to the project
 4. Sync secrets based on the environment:
    - **Dev**: Reads from `.env` or `.env.local`, lists all variables, and syncs after confirmation
-   - **Staging/Production**: Reads keys from `.env.example` (or existing BWS secrets as fallback), prompts for each value, then updates your GitHub Actions workflow file and environment secrets
+   - **Staging/Production**: Choose to paste env output (bulk) or enter each value manually, then updates your GitHub Actions workflow file and environment secrets
+
+## Bulk import from env output
+
+For staging/production, instead of entering each secret manually, you can paste the output from a running container:
+
+```bash
+# SSH into your server, then:
+docker exec <container-name> env
+```
+
+Copy the output and paste it when the script prompts you. The script will:
+
+1. Parse all `KEY=VALUE` pairs from the pasted output
+2. Filter to only the keys in your `.env.example` (ignoring system vars like `PATH`, `HOME`, etc.)
+3. Show a summary of matched vs missing secrets
+4. Bulk sync all matched secrets to BWS in one go
 
 ## How it determines secret keys
 

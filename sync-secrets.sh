@@ -111,6 +111,30 @@ parse_env_file() {
     done < "$file"
 }
 
+# Parse pasted env output (from: docker exec <container> env)
+parse_env_input() {
+    local line
+    while IFS= read -r line; do
+        # Empty line signals end of input
+        [[ -z "${line// }" ]] && break
+
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+
+            value="${value%\"}"
+            value="${value#\"}"
+            value="${value%\'}"
+            value="${value#\'}"
+            value="${value%"${value##*[![:space:]]}"}"
+
+            SECRETS[$key]="$value"
+        fi
+    done
+}
+
 echo ""
 log_info "Repository: $REPO_NAME"
 
@@ -118,8 +142,8 @@ log_info "Repository: $REPO_NAME"
 echo ""
 echo "Select environment:"
 echo "  1) dev        - Sync from .env file"
-echo "  2) staging    - Enter values manually"
-echo "  3) production - Enter values manually"
+echo "  2) staging    - Paste env output or enter manually"
+echo "  3) production - Paste env output or enter manually"
 echo ""
 read -p "Choice [1-3]: " env_choice
 
@@ -221,7 +245,7 @@ if [[ "$ENV" == "dev" ]]; then
     log_success "Dev sync complete"
 
 else
-    # STAGING/PROD: Prompt for each value
+    # STAGING/PROD
 
     # Get list of keys from .env.example or existing secrets
     KEYS=()
@@ -244,49 +268,137 @@ else
         exit 1
     fi
 
+    # Choose input method
     echo ""
-    echo "Enter values for each secret (press Enter to skip, existing value kept):"
+    echo "How would you like to provide secret values?"
+    echo "  1) Enter each value manually"
+    echo "  2) Paste env output (from: docker exec <container> env)"
     echo ""
+    read -p "Choice [1-2]: " input_method
 
-    for KEY in "${KEYS[@]}"; do
-        # Get existing value (masked)
-        EXISTING_ID=$(echo "$EXISTING" | jq -r ".[] | select(.key == \"$KEY\") | .id" 2>/dev/null || echo "")
+    if [[ "$input_method" == "2" ]]; then
+        # BULK: Paste env output
+        echo ""
+        log_info "Paste your env output below (KEY=VALUE format, one per line)."
+        log_info "Press Enter on an empty line when done."
+        echo ""
 
-        if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
-            echo -e "${CYAN}?${NC} $KEY ${YELLOW}(has existing value)${NC}"
-        else
-            echo -e "${CYAN}?${NC} $KEY ${YELLOW}(new)${NC}"
+        parse_env_input
+
+        # Filter to only keys we care about
+        declare -A FILTERED
+        MATCHED=0
+        for KEY in "${KEYS[@]}"; do
+            if [[ -n "${SECRETS[$KEY]+x}" ]]; then
+                FILTERED[$KEY]="${SECRETS[$KEY]}"
+                ((MATCHED++)) || true
+            fi
+        done
+
+        # Show summary
+        echo ""
+        log_info "Found $MATCHED of ${#KEYS[@]} secrets from env output"
+        echo ""
+
+        echo "Matched secrets:"
+        for KEY in $(echo "${!FILTERED[@]}" | tr ' ' '\n' | sort); do
+            echo -e "  ${GREEN}✓${NC} $KEY"
+        done
+
+        # Show missing keys
+        MISSING=()
+        for KEY in "${KEYS[@]}"; do
+            if [[ -z "${FILTERED[$KEY]+x}" ]]; then
+                EXISTING_ID=$(echo "$EXISTING" | jq -r ".[] | select(.key == \"$KEY\") | .id" 2>/dev/null || echo "")
+                if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
+                    echo -e "  ${YELLOW}~${NC} $KEY (not in paste, keeping existing)"
+                    UUID_MAP[$KEY]="$EXISTING_ID"
+                else
+                    MISSING+=("$KEY")
+                fi
+            fi
+        done
+
+        if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo ""
+            log_warn "Missing secrets (not in paste, no existing value):"
+            for KEY in "${MISSING[@]}"; do
+                echo -e "  ${RED}✗${NC} $KEY"
+            done
         fi
 
-        read -p "  Value: " VALUE
+        echo ""
+        read -p "Continue? [y/N]: " confirm
+        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 0
 
-        if [[ -z "$VALUE" ]]; then
+        # Sync filtered secrets
+        for KEY in "${!FILTERED[@]}"; do
+            VALUE="${FILTERED[$KEY]}"
+            EXISTING_ID=$(echo "$EXISTING" | jq -r ".[] | select(.key == \"$KEY\") | .id" 2>/dev/null || echo "")
+
             if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
-                log_info "Keeping existing: $KEY"
+                log_info "Updating: $KEY"
+                if ! bws secret edit --value "$VALUE" "$EXISTING_ID" -t "$ACCESS_TOKEN" -o none; then
+                    log_error "Failed to update $KEY"
+                    continue
+                fi
                 UUID_MAP[$KEY]="$EXISTING_ID"
             else
-                log_warn "Skipping: $KEY (no value)"
+                log_info "Creating: $KEY"
+                if ! RESULT=$(bws secret create "$KEY" "$VALUE" "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json); then
+                    log_error "Failed to create $KEY"
+                    continue
+                fi
+                SECRET_ID=$(echo "$RESULT" | jq -r '.id')
+                UUID_MAP[$KEY]="$SECRET_ID"
             fi
-            continue
-        fi
+        done
 
-        if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
-            log_info "Updating: $KEY"
-            if ! bws secret edit --value "$VALUE" "$EXISTING_ID" -t "$ACCESS_TOKEN" -o none; then
-                log_error "Failed to update $KEY"
+    else
+        # MANUAL: Prompt for each value
+        echo ""
+        echo "Enter values for each secret (press Enter to skip, existing value kept):"
+        echo ""
+
+        for KEY in "${KEYS[@]}"; do
+            EXISTING_ID=$(echo "$EXISTING" | jq -r ".[] | select(.key == \"$KEY\") | .id" 2>/dev/null || echo "")
+
+            if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
+                echo -e "${CYAN}?${NC} $KEY ${YELLOW}(has existing value)${NC}"
+            else
+                echo -e "${CYAN}?${NC} $KEY ${YELLOW}(new)${NC}"
+            fi
+
+            read -p "  Value: " VALUE
+
+            if [[ -z "$VALUE" ]]; then
+                if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
+                    log_info "Keeping existing: $KEY"
+                    UUID_MAP[$KEY]="$EXISTING_ID"
+                else
+                    log_warn "Skipping: $KEY (no value)"
+                fi
                 continue
             fi
-            UUID_MAP[$KEY]="$EXISTING_ID"
-        else
-            log_info "Creating: $KEY"
-            if ! RESULT=$(bws secret create "$KEY" "$VALUE" "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json); then
-                log_error "Failed to create $KEY"
-                continue
+
+            if [[ -n "$EXISTING_ID" && "$EXISTING_ID" != "null" ]]; then
+                log_info "Updating: $KEY"
+                if ! bws secret edit --value "$VALUE" "$EXISTING_ID" -t "$ACCESS_TOKEN" -o none; then
+                    log_error "Failed to update $KEY"
+                    continue
+                fi
+                UUID_MAP[$KEY]="$EXISTING_ID"
+            else
+                log_info "Creating: $KEY"
+                if ! RESULT=$(bws secret create "$KEY" "$VALUE" "$PROJECT_ID" -t "$ACCESS_TOKEN" -o json); then
+                    log_error "Failed to create $KEY"
+                    continue
+                fi
+                SECRET_ID=$(echo "$RESULT" | jq -r '.id')
+                UUID_MAP[$KEY]="$SECRET_ID"
             fi
-            SECRET_ID=$(echo "$RESULT" | jq -r '.id')
-            UUID_MAP[$KEY]="$SECRET_ID"
-        fi
-    done
+        done
+    fi
 
     log_success "Secrets synced for $ENV"
 
